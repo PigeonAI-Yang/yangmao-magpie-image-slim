@@ -51,10 +51,10 @@ export function onRequest(body, ctx) {
     const retainedAudio = audio.length ? collectResponses(body).audio : found?.audio ?? []
     const bytes = requestBytes(body, [...(found?.images ?? []), ...retainedAudio])
     if (bytes <= o.request_budget_bytes) return audio.length ? body : undefined
-    const floor = turnStart(found?.turns ?? [], 1)
+    const current = currentImages(found)
     let removed = 0
     for (const image of found?.images ?? []) {
-      if (floor >= 0 && image.index >= floor) continue
+      if (current.has(image)) continue
       image.set(placeholder(o, image))
       removed++
     }
@@ -166,6 +166,27 @@ function turnStart(turns, n) {
   return turns[Math.max(0, turns.length - n)]
 }
 
+function currentImages(found) {
+  if (!found) return new Set()
+  const start = turnStart(found.turns, 1)
+  const current = found.images.filter((image) => start >= 0 && image.index >= start)
+  if (found.latestDispatch !== start) return new Set(current)
+
+  // Keep all images from the latest generation and the latest reference read.
+  const generated = current.findLast((image) => image.generated)?.index
+  const reference = current.findLast((image) => image.kind === "tool" && !image.generated)?.index
+  return new Set(current.filter((image) => image.kind === "attachment" ||
+    image.index === generated || image.index === reference))
+}
+
+function isCodexDispatch(item) {
+  return item.type === "function_call_output" && !item.call_id &&
+    (item.name === undefined || item.name === "send_message_to_thread") &&
+    typeof item.output === "string" &&
+    /^<codex_delegation>\s*<source_thread_id>[\da-f]{8}(?:-[\da-f]{4}){3}-[\da-f]{12}<\/source_thread_id>\s*<input>/.test(item.output) &&
+    item.output.trimEnd().endsWith("</input>\n</codex_delegation>")
+}
+
 function options(raw) {
   const o = raw && typeof raw === "object" ? raw : {}
   const num = (v, d) => (typeof v === "number" && isFinite(v) && v >= 0 ? Math.floor(v) : d)
@@ -199,7 +220,7 @@ function collect(body, protocol) {
   return collectChat(body)
 }
 
-// A turn starts at a message the user sent. Tool results are not turns even
+// A turn starts at a user message or a Codex cross-chat dispatch. Other tool results are not turns even
 // where an API carries them in a user-role message: Claude Code's tool_result
 // and Gemini's functionResponse both come back that way, and the turn they
 // belong to began earlier. An image with no words beside it is still a turn.
@@ -213,6 +234,7 @@ function collectResponses(body) {
   const images = []
   const audio = []
   const turns = []
+  let latestDispatch = -1
   function collectAudio(part, parts, at, index, call, role) {
     if (part?.type !== "input_audio") return
     const dataUrl = typeof part.audio_url === "string" && part.audio_url.startsWith("data:audio/") ? part.audio_url : ""
@@ -227,6 +249,10 @@ function collectResponses(body) {
   input.forEach((it, index) => {
     if (!it) return
     if (it.type === "message" && it.role === "user") turns.push(index)
+    if (isCodexDispatch(it)) {
+      turns.push(index)
+      latestDispatch = index
+    }
     if (it.type === "message" && Array.isArray(it.content)) {
       it.content.forEach((part, at) => {
         collectAudio(part, it.content, at, index, null, it.role)
@@ -241,12 +267,14 @@ function collectResponses(body) {
         })
       })
     } else if ((it.type === "function_call_output" || it.type === "custom_tool_call_output") && Array.isArray(it.output)) {
+      const generated = it.output.some((part) => part?.type === "input_text" &&
+        /^Generated images are saved to\s+.+[\\/]generated_images[\\/]/m.test(part.text))
       it.output.forEach((part, at) => {
         const call = calls.get(it.call_id)
         collectAudio(part, it.output, at, index, call)
         if (!isDataUrlPart(part, "input_image", "image_url")) return
         images.push({
-          index, kind: "tool", tool: call?.name || "", path: pathOf(call), mime: mimeOf(part.image_url),
+          index, kind: "tool", generated, tool: call?.name || "", path: pathOf(call), mime: mimeOf(part.image_url),
           bytes: part.image_url.length, dataUrl: part.image_url,
           replaceUrl: (url) => { part.image_url = url },
           describe: (text) => { it.output.splice(it.output.indexOf(part) + 1, 0, { type: "input_text", text }) },
@@ -258,7 +286,7 @@ function collectResponses(body) {
       })
     }
   })
-  return { images, audio, turns }
+  return { images, audio, turns, latestDispatch }
 }
 
 function collectAnthropic(body) {
@@ -403,4 +431,4 @@ function mb(bytes) {
 }
 
 // Tests use these; magpie never calls them.
-export const _internal = { options, collect, keepSet, turnStart, placeholder, pathOf, hash, matches, requestBytes, matchesAudio, audioToOmit, audioPlaceholder }
+export const _internal = { options, collect, currentImages, keepSet, turnStart, placeholder, pathOf, hash, matches, requestBytes, matchesAudio, audioToOmit, audioPlaceholder }
