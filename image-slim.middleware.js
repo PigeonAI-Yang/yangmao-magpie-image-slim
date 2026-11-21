@@ -40,12 +40,17 @@ const DEFAULT_AGENTS = ["codex"]
 export function onRequest(body, ctx) {
   const o = options(ctx.options)
   if (ctx.protocol !== "responses") return
-  if (!matches(ctx, o)) return
+  const imageRoute = matches(ctx, o)
+  if (!imageRoute && !matchesAudio(ctx, o)) return
 
   const found = collect(body, ctx.protocol)
+  const audio = audioToOmit(found, ctx, o)
+  for (const clip of audio) clip.set(audioPlaceholder())
+  if (!imageRoute) return audio.length ? body : undefined
   if (o.request_budget_bytes && ctx.protocol === "responses") {
-    const bytes = requestBytes(body, found?.images ?? [])
-    if (bytes <= o.request_budget_bytes) return
+    const retainedAudio = audio.length ? collectResponses(body).audio : found?.audio ?? []
+    const bytes = requestBytes(body, [...(found?.images ?? []), ...retainedAudio])
+    if (bytes <= o.request_budget_bytes) return audio.length ? body : undefined
     const floor = turnStart(found?.turns ?? [], 1)
     let removed = 0
     for (const image of found?.images ?? []) {
@@ -53,18 +58,19 @@ export function onRequest(body, ctx) {
       image.set(placeholder(o, image))
       removed++
     }
-    const after = requestBytes(body, collectResponses(body)?.images ?? [])
+    const remaining = collectResponses(body)
+    const after = requestBytes(body, [...(remaining?.images ?? []), ...(remaining?.audio ?? [])])
     if (after > o.request_budget_bytes) {
-      ctx.reject(413, "This Codex request exceeds the image budget even after removing older images. Send a smaller current image batch or compact the text context.")
+      ctx.reject(413, "This Codex request exceeds the request budget after trimming history. Send smaller attachments or compact the text context.")
       return
     }
     if (o.log) console.log(`image-slim budget fallback: ${bytes} -> ${after} bytes, ${removed} historical images replaced with text`)
     return body
   }
-  if (!found || !found.images.length) return
+  if (!found || !found.images.length) return audio.length ? body : undefined
 
   const before = found.images.reduce((n, img) => n + img.bytes, 0)
-  if (before < o.trigger_bytes) return
+  if (before < o.trigger_bytes) return audio.length ? body : undefined
   const keep = keepSet(found, o)
   let slimmed = 0
   let after = before
@@ -78,7 +84,7 @@ export function onRequest(body, ctx) {
     slimmed++
     after -= img.bytes
   }
-  if (!slimmed) return
+  if (!slimmed) return audio.length ? body : undefined
   if (o.log) console.log(`image-slim: [${ctx.agent}] ${slimmed} image(s) left out, ${mb(before)} MB of images -> ${mb(after)} MB (${found.images.length - slimmed} kept)`)
   return body
 }
@@ -90,17 +96,18 @@ function matches(ctx, o) {
     : m === ctx.model)
 }
 
-function requestBytes(body, images) {
+function requestBytes(body, media) {
   let urls = 0
-  for (const image of images) {
-    urls += image.bytes
-    image.replaceUrl("")
+  for (const item of media) {
+    if (!item.dataUrl) continue
+    urls += item.bytes
+    item.replaceUrl("")
   }
   let json
   try {
     json = JSON.stringify(body)
   } finally {
-    for (const image of images) image.replaceUrl(image.dataUrl)
+    for (const item of media) if (item.dataUrl) item.replaceUrl(item.dataUrl)
   }
   let bytes = json.length + urls
   const nonAscii = /[^\u0000-\u007f]/gu
@@ -109,6 +116,24 @@ function requestBytes(body, images) {
     bytes += match[0].length === 2 ? 2 : match[0].charCodeAt(0) < 2048 ? 1 : 2
   }
   return bytes
+}
+
+function matchesAudio(ctx, policy) {
+  return !policy.keep_audio && (matches(ctx, policy) ||
+    (ctx.model === "gpt-6.2-sol" && matches({ ...ctx, model: "codex/gpt-6.2-sol" }, policy)))
+}
+
+function audioToOmit(found, ctx, policy) {
+  if (!found?.audio.length || !matchesAudio(ctx, policy)) return []
+  const sol = ctx.model === "codex/gpt-6.2-sol" || ctx.model === "gpt-6.2-sol"
+  if (sol) return found.audio
+  const current = turnStart(found.turns, 1)
+  return current < 0 ? [] : found.audio.filter((clip) => clip.index < current && clip.dataUrl)
+}
+
+function audioPlaceholder(path, recovery) {
+  const reference = path ? ` The local file is ${JSON.stringify(path)}.` : ""
+  return `[Magpie omitted raw audio from this request.${reference}${recovery ? " " + recovery : ""} Use any existing transcript. If you need the content, use a transcription tool authorized for this chat and return text, or ask the user for a transcript.]`
 }
 
 // keepSet is what stays inline: the newest keep_last images, every image of
@@ -152,6 +177,7 @@ function options(raw) {
     min_bytes: num(o.min_bytes, 8192),
     trigger_bytes: num(o.trigger_bytes, 12582912),
     request_budget_bytes: num(o.request_budget_bytes, 70000000),
+    keep_audio: o.keep_audio === true,
     // An explicit [] means every agent; leaving the option out means Codex.
     agents: "agents" in o ? list(o.agents) : DEFAULT_AGENTS,
     models: "models" in o ? list(o.models) : ["codex/*"],
@@ -185,12 +211,25 @@ function collectResponses(body) {
     if (it && (it.type === "function_call" || it.type === "custom_tool_call") && it.call_id) calls.set(it.call_id, it)
   }
   const images = []
+  const audio = []
   const turns = []
+  function collectAudio(part, parts, at, index, call, role) {
+    if (part?.type !== "input_audio") return
+    const dataUrl = typeof part.audio_url === "string" && part.audio_url.startsWith("data:audio/") ? part.audio_url : ""
+    const nearby = parts[at - 1]?.text
+    const local = typeof nearby === "string" ? /^<audio name=\[Audio #\d+\] path="([^"\r\n]+)">$/.exec(nearby)?.[1] : ""
+    audio.push({
+      index, dataUrl, bytes: dataUrl.length, path: local || pathOf(call, ["audio_path", "audio_file"]),
+      replaceUrl: (url) => { part.audio_url = url },
+      set: (text) => { parts[at] = { type: role === "assistant" ? "output_text" : "input_text", text } },
+    })
+  }
   input.forEach((it, index) => {
     if (!it) return
     if (it.type === "message" && it.role === "user") turns.push(index)
     if (it.type === "message" && Array.isArray(it.content)) {
       it.content.forEach((part, at) => {
+        collectAudio(part, it.content, at, index, null, it.role)
         if (!isDataUrlPart(part, "input_image", "image_url")) return
         images.push({
           index, kind: "attachment", tool: "", path: "", mime: mimeOf(part.image_url),
@@ -203,8 +242,9 @@ function collectResponses(body) {
       })
     } else if ((it.type === "function_call_output" || it.type === "custom_tool_call_output") && Array.isArray(it.output)) {
       it.output.forEach((part, at) => {
-        if (!isDataUrlPart(part, "input_image", "image_url")) return
         const call = calls.get(it.call_id)
+        collectAudio(part, it.output, at, index, call)
+        if (!isDataUrlPart(part, "input_image", "image_url")) return
         images.push({
           index, kind: "tool", tool: call?.name || "", path: pathOf(call), mime: mimeOf(part.image_url),
           bytes: part.image_url.length, dataUrl: part.image_url,
@@ -218,7 +258,7 @@ function collectResponses(body) {
       })
     }
   })
-  return { images, turns }
+  return { images, audio, turns }
 }
 
 function collectAnthropic(body) {
@@ -300,14 +340,14 @@ function collectGemini(body) {
   return { images, turns }
 }
 
-function pathOf(call) {
+function pathOf(call, prefer = []) {
   if (!call) return ""
   let args = call.arguments ?? call.input
   if (typeof args === "string") {
     try { args = JSON.parse(args) } catch { return "" }
   }
   if (!args || typeof args !== "object") return ""
-  for (const key of ["path", "file_path", "image_path", "screenshot_path", "filename", "file"]) {
+  for (const key of [...prefer, "path", "file_path", "image_path", "screenshot_path", "filename", "file"]) {
     if (typeof args[key] === "string" && args[key]) return args[key]
   }
   return ""
@@ -363,4 +403,4 @@ function mb(bytes) {
 }
 
 // Tests use these; magpie never calls them.
-export const _internal = { options, collect, keepSet, turnStart, placeholder, pathOf, hash, matches, requestBytes }
+export const _internal = { options, collect, keepSet, turnStart, placeholder, pathOf, hash, matches, requestBytes, matchesAudio, audioToOmit, audioPlaceholder }

@@ -1,7 +1,7 @@
 import { fileURLToPath } from "node:url"
 import { _internal } from "./image-slim.middleware.js"
 
-const { collect, matches, options, placeholder, requestBytes, turnStart } = _internal
+const { collect, matches, options, placeholder, requestBytes, turnStart, matchesAudio, audioToOmit, audioPlaceholder } = _internal
 const worker = fileURLToPath(new URL("./image-preview.py", import.meta.url))
 const MAX_PREVIEW_BYTES = 128_000
 const FORWARDING_MARGIN = 256_000
@@ -18,7 +18,7 @@ function restoreCommand(ctx, archive, digest) {
 
 function mentionsArchive(value, archive) {
   if (typeof value === "string") {
-    if (!value.startsWith("data:image/") && value.includes(archive.split(/[/\\]/).at(-1))) {
+    if (!value.startsWith("data:") && value.includes(archive.split(/[/\\]/).at(-1))) {
       const normalized = value.replace(/\\+/g, "/")
       return normalized.includes(archive.replace(/\\+/g, "/") + "/")
     }
@@ -48,24 +48,51 @@ async function prepareImages(images, archive, ctx) {
 
 export async function onRequest(body, ctx) {
   const policy = options(ctx.options)
-  if (ctx.protocol !== "responses" || !policy.request_budget_bytes || !matches(ctx, policy)) return
+  if (ctx.protocol !== "responses") return
+  const imageRoute = policy.request_budget_bytes && matches(ctx, policy)
+  if (!imageRoute && !matchesAudio(ctx, policy)) return
   const archive = ["local", "magpie-key"].includes(ctx.origin) ? ctx.options.archive_path ?? "" : ""
   const legacyRestore = restoreCommand(ctx, archive, "IMAGE_SHA256")
   const hasLegacyPath = legacyRestore && mentionsArchive(body.input, archive)
   if (hasLegacyPath) {
-    const instruction = `To open a previous Magpie cached image, first try view_image. If the cached file is missing, run this local PowerShell command with IMAGE_SHA256 replaced by the 64 hexadecimal characters in the cached filename, without its extension: ${legacyRestore} . Then use view_image on the returned path. Ask for reattachment only if the local recovery fails.`
+    const instruction = `To open previous Magpie cached media, try the cached file first. If it is missing, run this local PowerShell command with IMAGE_SHA256 replaced by the 64 hexadecimal characters in the cached filename, without its extension: ${legacyRestore} . Open images with view_image. For audio, use any existing transcript or an authorized transcription tool that returns text.`
     if (typeof body.instructions === "string") body.instructions += "\n\n" + instruction
     else if (Array.isArray(body.input)) body.input.unshift({ type: "message", role: "developer", content: [{ type: "input_text", text: instruction }] })
   }
   const found = collect(body, ctx.protocol)
-  if (!found?.images.length) return hasLegacyPath ? body : undefined
-  const before = requestBytes(body, found.images)
-  if (before < policy.trigger_bytes) return hasLegacyPath ? body : undefined
+  const audio = audioToOmit(found, ctx, policy)
+  if (!found || (!found.images.length && !audio.length)) return hasLegacyPath ? body : undefined
+  const before = requestBytes(body, [...found.images, ...found.audio])
+  const audioJobs = archive ? audio.filter((clip) => clip.dataUrl) : []
+  let audioReferences = []
+  try {
+    audioReferences = await prepareImages(audioJobs.map((image) => ({ image, preview: false })), archive, ctx)
+  } catch {
+    // The request can still continue if the archive is unavailable.
+  }
+  const audioOriginals = new Map(audioJobs.map((clip, index) => [clip, audioReferences[index]]))
+  for (const clip of audio) {
+    const original = audioOriginals.get(clip)
+    const path = original?.path || (archive ? clip.path : "")
+    const command = restoreCommand(ctx, archive, original?.sha256)
+    const recovery = command
+      ? `${path ? "If the file is missing, run" : "To recover the file, run"} this local PowerShell command and use the returned file path: ${command} .`
+      : ""
+    clip.set(audioPlaceholder(path, recovery))
+  }
+  const size = () => {
+    const media = collect(body, ctx.protocol)
+    return requestBytes(body, [...media.images, ...media.audio])
+  }
+  const afterAudio = audio.length ? size() : before
+  if (policy.log && audio.length) console.log(`image-slim audio: ${before} -> ${afterAudio} bytes, ${audio.length} audio items replaced with references`)
+  const changed = hasLegacyPath || audio.length > 0
+  if (!imageRoute || !found.images.length || afterAudio < policy.trigger_bytes) return changed ? body : undefined
   const budget = Math.max(Math.floor(policy.request_budget_bytes * 0.95), policy.request_budget_bytes - FORWARDING_MARGIN)
   const currentStart = turnStart(found.turns, 1)
   const previousTurns = Number.isSafeInteger(ctx.options.preview_turns) ? Math.max(0, ctx.options.preview_turns) : 5
   const historyStart = turnStart(found.turns, 1 + previousTurns)
-  if (currentStart < 0) return hasLegacyPath ? body : undefined
+  if (currentStart < 0) return changed ? body : undefined
 
   const current = found.images.filter((image) => image.index >= currentStart)
   const historical = found.images.filter((image) => image.index < currentStart)
@@ -77,7 +104,6 @@ export async function onRequest(body, ctx) {
   const encoded = new Map(jobs.map(({ image }, index) => [image, results[index]]))
   const previews = new Map()
   const omitted = new Set()
-  const size = () => requestBytes(body, collect(body, ctx.protocol).images)
 
   function reference(image) {
     const archivePath = encoded.get(image)?.path
@@ -146,5 +172,5 @@ export async function onRequest(body, ctx) {
     console.log(`image-preview: ${before} -> ${after} bytes, ${kept} historical images kept (${previews.size - currentPreviews} previews), ${omitted.size} omitted, ${current.length - currentPreviews}/${current.length} current originals, ${stored} original references`)
   }
   ctx.report?.("image-preview", after)
-  if (omitted.size || previews.size || hasLegacyPath) return body
+  if (omitted.size || previews.size || changed) return body
 }

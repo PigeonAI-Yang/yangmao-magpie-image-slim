@@ -17,10 +17,16 @@ from PIL import Image, ImageOps
 
 ARCHIVE_LIMIT = 1024**3
 MIN_FREE_DISK = 1024**3
-ARCHIVE_NAME = re.compile(r"[0-9a-f]{64}\.(png|jpeg|webp|gif)")
+AUDIO_SUFFIXES = {
+    b"audio/wav": "wav", b"audio/wave": "wav", b"audio/x-wav": "wav",
+    b"audio/mpeg": "mp3", b"audio/mp3": "mp3", b"audio/flac": "flac",
+    b"audio/ogg": "ogg", b"audio/webm": "webm", b"audio/mp4": "m4a",
+    b"audio/x-m4a": "m4a", b"audio/aac": "aac", b"audio/opus": "opus",
+}
+ARCHIVE_NAME = re.compile(r"[0-9a-f]{64}\.(png|jpeg|webp|gif|" + "|".join(sorted(set(AUDIO_SUFFIXES.values()))) + ")")
 THREAD_ID = re.compile(r"[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}")
 CHECKSUM = re.compile(r"[0-9a-f]{64}")
-INLINE_IMAGE = re.compile(rb"data:image/[^,\x22\s]+;base64,([a-zA-Z0-9+/=]+)")
+INLINE_MEDIA = re.compile(rb"data:((?:image|audio)/[^,;\x22\s]+);base64,([a-zA-Z0-9+/=]+)")
 archive = None
 
 
@@ -121,9 +127,9 @@ def session_records(codex_root, thread_id):
 
 def restore(codex_root, thread_id, digest):
     if not THREAD_ID.fullmatch(thread_id) or not CHECKSUM.fullmatch(digest):
-        return {"error": "Invalid Codex thread ID or image checksum"}
+        return {"error": "Invalid Codex thread ID or media checksum"}
     if archive is None:
-        return {"error": "Image cache is unavailable"}
+        return {"error": "Media cache is unavailable"}
     try:
         for candidate in archive.glob(f"{digest}.*"):
             if ARCHIVE_NAME.fullmatch(candidate.name) and candidate.is_file():
@@ -133,30 +139,41 @@ def restore(codex_root, thread_id, digest):
         for record in session_records(codex_root, thread_id):
             with record.open("rb") as history:
                 for line in history:
-                    for match in INLINE_IMAGE.finditer(line):
+                    for match in INLINE_MEDIA.finditer(line):
                         try:
-                            raw = base64.b64decode(match[1], validate=True)
+                            raw = base64.b64decode(match[2], validate=True)
                         except binascii.Error:
                             continue
                         if hashlib.sha256(raw).hexdigest() != digest:
                             continue
-                        with Image.open(io.BytesIO(raw), formats=("PNG", "JPEG", "WEBP", "GIF")) as image:
-                            path = original(raw, image.format.lower(), digest)
+                        suffix = AUDIO_SUFFIXES.get(match[1])
+                        if suffix is None:
+                            if not match[1].startswith(b"image/"):
+                                continue
+                            with Image.open(io.BytesIO(raw), formats=("PNG", "JPEG", "WEBP", "GIF")) as image:
+                                suffix = image.format.lower()
+                        path = original(raw, suffix, digest)
                         if path:
                             return {"path": path, "source": "codex_history"}
                         return {"error": "Found the original in Codex history but could not save it to the cache"}
     except OSError:
-        return {"error": "Could not read the local Codex record or image cache"}
-    return {"error": "The original image is no longer embedded in this Codex thread's local record"}
+        return {"error": "Could not read the local Codex record or media cache"}
+    return {"error": "The original media is no longer embedded in this Codex thread's local record"}
 
 
 def prepare(line):
     operation, _, image_url = line.rstrip(b"\r\n").partition(b" ")
     header, _, payload = image_url.partition(b",")
-    if not header.startswith(b"data:image/") or not header.endswith(b";base64"):
+    if not header.startswith((b"data:image/", b"data:audio/")) or not header.endswith(b";base64"):
         return None
     try:
         raw = base64.b64decode(payload, validate=True)
+        if header.startswith(b"data:audio/"):
+            suffix = AUDIO_SUFFIXES.get(header[5:-7])
+            if not suffix or not raw:
+                return None
+            digest = hashlib.sha256(raw).hexdigest()
+            return {"path": original(raw, suffix, digest), "sha256": digest}
         with Image.open(io.BytesIO(raw), formats=("PNG", "JPEG", "WEBP", "GIF")) as image:
             digest = hashlib.sha256(raw).hexdigest()
             path = original(raw, image.format.lower(), digest)
