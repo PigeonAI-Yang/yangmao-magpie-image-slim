@@ -1,0 +1,45 @@
+{
+  "name": "yangmao-magpie-image-slim",
+  "version": "0.1.0",
+  "description": "Keep image-heavy Codex chats usable. Magpie previews, a request budget, and optional local original recovery. Maintained by Yangmao.",
+  "type": "module",
+  "files": [
+    "image-slim.middleware.js",
+    "image-preview.hooks.mjs",
+    "image-preview.py",
+    "README.md",
+    "README.en.md",
+    "assets"
+  ],
+  "license": "MIT",
+  "homepage": "https://ymtuan.live/",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/PigeonAI-Yang/yangmao-magpie-image-slim.git"
+  },
+  "keywords": [
+    "magpie-plugin",
+    "magpie",
+    "codex",
+    "image-history",
+    "context-window"
+  ],
+  "magpie": {
+    "name": "Yangmao · Image Slim",
+    "summary": {
+      "zh": "给 Codex 旧图留预览，控制请求体积。支持从本机聊天记录找回原图，由羊毛团维护。",
+      "en": "Keep previews in image-heavy Codex chats, bound request size, and optionally recover originals locally. Maintained by Yangmao."
+    },
+    "icon": "https://raw.githubusercontent.com/PigeonAI-Yang/yangmao-magpie-image-slim/main/assets/yangmao-symbol.png",
+    "middleware": "./image-slim.middleware.js",
+    "hooks": "./image-preview.hooks.mjs",
+    "options": {
+      "request_budget_bytes": 70000000,
+      "trigger_bytes": 12582912,
+      "preview_turns": 5,
+      "gatewayTimeoutMs": 15000,
+      "python_path": "python",
+      "models": ["codex/*"]
+    }
+  }
+}
