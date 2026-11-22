@@ -39,29 +39,32 @@ const DEFAULT_AGENTS = ["codex"]
 // Return the body to send a changed one, undefined to send it as it came.
 export function onRequest(body, ctx) {
   const o = options(ctx.options)
-  if (ctx.protocol !== "responses") return
-  const imageRoute = matches(ctx, o)
+  const dsh = dshImageRoute(ctx)
+  if (ctx.protocol !== "responses" && !dsh) return
+  const imageRoute = dsh ? o.dsh_budget_bytes > 0 : matches(ctx, o)
   if (!imageRoute && !matchesAudio(ctx, o)) return
 
   const found = collect(body, ctx.protocol)
   const audio = audioToOmit(found, ctx, o)
   for (const clip of audio) clip.set(audioPlaceholder())
   if (!imageRoute) return audio.length ? body : undefined
-  if (o.request_budget_bytes && ctx.protocol === "responses") {
-    const retainedAudio = audio.length ? collectResponses(body).audio : found?.audio ?? []
+  const budget = dsh ? o.dsh_budget_bytes : o.request_budget_bytes
+  if (dsh && !found?.images.length) return audio.length ? body : undefined
+  if (budget) {
+    const retainedAudio = audio.length ? collect(body, ctx.protocol)?.audio ?? [] : found?.audio ?? []
     const bytes = requestBytes(body, [...(found?.images ?? []), ...retainedAudio])
-    if (bytes <= o.request_budget_bytes) return audio.length ? body : undefined
-    const current = currentImages(found)
+    if (bytes <= budget) return audio.length ? body : undefined
+    const current = currentImages(found, dsh)
     let removed = 0
     for (const image of found?.images ?? []) {
       if (current.has(image)) continue
       image.set(placeholder(o, image))
       removed++
     }
-    const remaining = collectResponses(body)
+    const remaining = collect(body, ctx.protocol)
     const after = requestBytes(body, [...(remaining?.images ?? []), ...(remaining?.audio ?? [])])
-    if (after > o.request_budget_bytes) {
-      ctx.reject(413, "This Codex request exceeds the request budget after trimming history. Send smaller attachments or compact the text context.")
+    if (after > budget) {
+      ctx.reject(413, `This ${dsh ? "DeepSeek Harness" : "Codex"} request exceeds the request budget after trimming history. Send smaller attachments or compact the text context.`)
       return
     }
     if (o.log) console.log(`image-slim budget fallback: ${bytes} -> ${after} bytes, ${removed} historical images replaced with text`)
@@ -96,6 +99,10 @@ function matches(ctx, o) {
     : m === ctx.model)
 }
 
+function dshImageRoute(ctx) {
+  return ctx.agent === "dsh" && (ctx.protocol === "responses" || ctx.path === "/v1/chat/completions")
+}
+
 function requestBytes(body, media) {
   let urls = 0
   for (const item of media) {
@@ -119,12 +126,12 @@ function requestBytes(body, media) {
 }
 
 function matchesAudio(ctx, policy) {
-  return !policy.keep_audio && (matches(ctx, policy) ||
+  return ctx.protocol === "responses" && !policy.keep_audio && (matches(ctx, policy) ||
     (ctx.model === "gpt-6.2-sol" && matches({ ...ctx, model: "codex/gpt-6.2-sol" }, policy)))
 }
 
 function audioToOmit(found, ctx, policy) {
-  if (!found?.audio.length || !matchesAudio(ctx, policy)) return []
+  if (!found?.audio?.length || !matchesAudio(ctx, policy)) return []
   const sol = ctx.model === "codex/gpt-6.2-sol" || ctx.model === "gpt-6.2-sol"
   if (sol) return found.audio
   const current = turnStart(found.turns, 1)
@@ -166,10 +173,14 @@ function turnStart(turns, n) {
   return turns[Math.max(0, turns.length - n)]
 }
 
-function currentImages(found) {
+function currentImages(found, dsh = false) {
   if (!found) return new Set()
   const start = turnStart(found.turns, 1)
   const current = found.images.filter((image) => start >= 0 && image.index >= start)
+  if (dsh) {
+    const latestTool = current.findLast((image) => image.kind === "tool")?.index
+    return new Set(current.filter((image) => image.kind === "attachment" || image.index === latestTool))
+  }
   if (found.latestDispatch !== start) return new Set(current)
 
   // Keep all images from the latest generation and the latest reference read.
@@ -198,6 +209,7 @@ function options(raw) {
     min_bytes: num(o.min_bytes, 8192),
     trigger_bytes: num(o.trigger_bytes, 12582912),
     request_budget_bytes: num(o.request_budget_bytes, 70000000),
+    dsh_budget_bytes: num(o.dsh_budget_bytes, 8000000),
     keep_audio: o.keep_audio === true,
     // An explicit [] means every agent; leaving the option out means Codex.
     agents: "agents" in o ? list(o.agents) : DEFAULT_AGENTS,
@@ -330,16 +342,24 @@ function collectChat(body) {
   const images = []
   const turns = []
   msgs.forEach((m, index) => {
-    if (m?.role === "user") turns.push(index)
     const list = Array.isArray(m?.content) ? m.content : null
+    // DSH's Chat Completions adapter moves tool images to a synthetic user message.
+    const toolImageMessage = m?.role === "user" && list?.[0]?.type === "text" &&
+      list[0].text === "Attached image(s) from tool result:"
+    if (m?.role === "user" && !toolImageMessage) turns.push(index)
     if (!list) return
     list.forEach((part, at) => {
       const url = part?.type === "image_url" ? (typeof part.image_url === "string" ? part.image_url : part.image_url?.url) : null
-      if (typeof url !== "string" || !url.startsWith("data:")) return
+      if (typeof url !== "string" || !url.startsWith("data:image/")) return
       images.push({
-        index, kind: "attachment", tool: "", path: "", mime: mimeOf(url),
+        index, kind: toolImageMessage || m.role === "tool" ? "tool" : "attachment", tool: "", path: "", mime: mimeOf(url),
         bytes: url.length, dataUrl: url,
         set: (text) => { list[at] = { type: "text", text } },
+        replaceUrl: (value) => {
+          if (typeof part.image_url === "string") part.image_url = value
+          else part.image_url.url = value
+        },
+        describe: (text) => { list.splice(list.indexOf(part) + 1, 0, { type: "text", text }) },
       })
     })
   })
@@ -431,4 +451,4 @@ function mb(bytes) {
 }
 
 // Tests use these; magpie never calls them.
-export const _internal = { options, collect, currentImages, keepSet, turnStart, placeholder, pathOf, hash, matches, requestBytes, matchesAudio, audioToOmit, audioPlaceholder }
+export const _internal = { options, collect, currentImages, dshImageRoute, keepSet, turnStart, placeholder, pathOf, hash, matches, requestBytes, matchesAudio, audioToOmit, audioPlaceholder }

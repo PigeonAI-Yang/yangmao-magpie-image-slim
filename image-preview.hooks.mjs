@@ -1,7 +1,7 @@
 import { fileURLToPath } from "node:url"
 import { _internal } from "./image-slim.middleware.js"
 
-const { collect, currentImages, matches, options, placeholder, requestBytes, turnStart, matchesAudio, audioToOmit, audioPlaceholder } = _internal
+const { collect, currentImages, dshImageRoute, matches, options, placeholder, requestBytes, turnStart, matchesAudio, audioToOmit, audioPlaceholder } = _internal
 const worker = fileURLToPath(new URL("./image-preview.py", import.meta.url))
 const MAX_PREVIEW_BYTES = 128_000
 const FORWARDING_MARGIN = 256_000
@@ -11,7 +11,7 @@ const CHECKSUM = /^[a-f0-9]{64}$/
 
 function restoreCommand(ctx, archive, digest) {
   const root = ctx.options.codex_history_path
-  if (!archive || !root || !THREAD_ID.test(ctx.session) || (digest !== "IMAGE_SHA256" && !CHECKSUM.test(digest))) return ""
+  if (ctx.agent === "dsh" || !archive || !root || !THREAD_ID.test(ctx.session) || (digest !== "IMAGE_SHA256" && !CHECKSUM.test(digest))) return ""
   const quote = (arg) => "'" + arg.replaceAll("'", "''") + "'"
   return "& " + [ctx.options.python_path ?? "python", "-I", worker, "--restore",
     archive, root, ctx.session, digest].map(quote).join(" ")
@@ -49,8 +49,10 @@ async function prepareImages(images, archive, ctx) {
 
 export async function onRequest(body, ctx) {
   const policy = options(ctx.options)
-  if (ctx.protocol !== "responses") return
-  const imageRoute = policy.request_budget_bytes && matches(ctx, policy)
+  const dsh = dshImageRoute(ctx)
+  if (ctx.protocol !== "responses" && !dsh) return
+  const requestBudget = dsh ? policy.dsh_budget_bytes : policy.request_budget_bytes
+  const imageRoute = requestBudget && (dsh || matches(ctx, policy))
   if (!imageRoute && !matchesAudio(ctx, policy)) return
   const archive = ["local", "magpie-key"].includes(ctx.origin) ? ctx.options.archive_path ?? "" : ""
   const legacyRestore = restoreCommand(ctx, archive, "IMAGE_SHA256")
@@ -63,7 +65,7 @@ export async function onRequest(body, ctx) {
   const found = collect(body, ctx.protocol)
   const audio = audioToOmit(found, ctx, policy)
   if (!found || (!found.images.length && !audio.length)) return hasLegacyPath ? body : undefined
-  const before = requestBytes(body, [...found.images, ...found.audio])
+  const before = requestBytes(body, [...found.images, ...(found.audio ?? [])])
   const audioJobs = archive ? audio.filter((clip) => clip.dataUrl) : []
   let audioReferences = []
   try {
@@ -83,22 +85,22 @@ export async function onRequest(body, ctx) {
   }
   const size = () => {
     const media = collect(body, ctx.protocol)
-    return requestBytes(body, [...media.images, ...media.audio])
+    return requestBytes(body, [...media.images, ...(media.audio ?? [])])
   }
   const afterAudio = audio.length ? size() : before
   if (policy.log && audio.length) console.log(`image-slim audio: ${before} -> ${afterAudio} bytes, ${audio.length} audio items replaced with references`)
   const changed = hasLegacyPath || audio.length > 0
   const currentStart = turnStart(found.turns, 1)
   const dispatched = currentStart >= 0 && found.latestDispatch === currentStart
-  if (!imageRoute || !found.images.length || (!dispatched && afterAudio < policy.trigger_bytes)) return changed ? body : undefined
-  let budget = Math.max(Math.floor(policy.request_budget_bytes * 0.95), policy.request_budget_bytes - FORWARDING_MARGIN)
+  if (!imageRoute || !found.images.length || (!dsh && !dispatched && afterAudio < policy.trigger_bytes)) return changed ? body : undefined
+  let budget = Math.max(Math.floor(requestBudget * 0.95), requestBudget - FORWARDING_MARGIN)
   // The plugin host reads a complete hook reply as one line, with a 32 MiB limit.
-  if (dispatched) budget = Math.min(budget, DISPATCH_HOOK_BUDGET)
+  if (dispatched || dsh) budget = Math.min(budget, DISPATCH_HOOK_BUDGET)
   const previousTurns = Number.isSafeInteger(ctx.options.preview_turns) ? Math.max(0, ctx.options.preview_turns) : 5
   const historyStart = turnStart(found.turns, 1 + previousTurns)
   if (currentStart < 0) return changed ? body : undefined
 
-  const originals = currentImages(found)
+  const originals = currentImages(found, dsh)
   const current = [...originals]
   const historical = found.images.filter((image) => !originals.has(image))
   const prepared = historical.map((image) => ({
@@ -117,7 +119,7 @@ export async function onRequest(body, ctx) {
   function originalInstruction(image) {
     const path = reference(image)
     const command = restoreCommand(ctx, archive, encoded.get(image)?.sha256)
-    const open = path ? `Use view_image to reopen the original at ${JSON.stringify(path)}.` : ""
+    const open = path ? `Use ${dsh ? "your image-reading tool" : "view_image"} to reopen the original at ${JSON.stringify(path)}.` : ""
     if (command) {
       const condition = path ? "If that file is missing or cannot be opened, run" : "To recover the original, run"
       return `${open ? open + " " : ""}${condition} this PowerShell command: ${command} . Then use view_image on the returned path. Ask for reattachment only if the local recovery fails.`
@@ -125,8 +127,7 @@ export async function onRequest(body, ctx) {
     return open || "If you need the full resolution original, ask the user to reattach it."
   }
   function omit(image) {
-    const recovery = restoreCommand(ctx, archive, encoded.get(image)?.sha256)
-    const text = recovery
+    const text = reference(image) || restoreCommand(ctx, archive, encoded.get(image)?.sha256)
       ? `[Historical image omitted from this request. ${originalInstruction(image)}]`
       : placeholder(policy, { ...image, path: reference(image) })
     image.set(text)
@@ -174,7 +175,7 @@ export async function onRequest(body, ctx) {
   const kept = historical.length - omitted.size
   const stored = [...encoded.values()].filter((entry) => entry?.path).length
   if (policy.log && (omitted.size || previews.size)) {
-    console.log(`image-preview: ${before} -> ${after} bytes, ${kept} historical images kept (${previews.size - currentPreviews} previews), ${omitted.size} omitted, ${current.length - currentPreviews}/${current.length} current originals, ${stored} original references${dispatched ? ", Codex dispatch" : ""}`)
+    console.log(`image-preview: ${before} -> ${after} bytes, ${kept} historical images kept (${previews.size - currentPreviews} previews), ${omitted.size} omitted, ${current.length - currentPreviews}/${current.length} current originals, ${stored} original references${dsh ? ", DeepSeek Harness" : dispatched ? ", Codex dispatch" : ""}`)
   }
   ctx.report?.("image-preview", after)
   if (omitted.size || previews.size || changed) return body

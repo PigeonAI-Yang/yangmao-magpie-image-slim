@@ -25,6 +25,8 @@ Continue your existing Codex chat. The default JSON budget is **70 MB** and the 
 
 Codex cross-chat dispatches start a new turn. The plugin prioritizes originals for direct attachments, the most recent reference images read by a tool, and the latest generated batch. Earlier images follow the history rules.
 
+For DeepSeek Harness image requests through Magpie, the plugin also supports Chat Completions and Responses. It prioritizes current attachments and the latest batch of tool images, and keeps previews from the previous five turns where possible. Set `dsh_budget_bytes` to change its separate 8 MB budget. Enable the local cache to reopen originals by path.
+
 Historical inline audio becomes a text reference. Existing transcripts and other tool output remain available. GPT‑6.2 Sol can reject raw audio, so the plugin replaces current-turn audio on that route too. Other matching routes still receive current-turn audio. Set `"keep_audio": true` when your model supports audio and you need full audio replay. The optional local cache and recovery flow also support common audio formats such as WAV and MP3.
 
 Original-image recovery is optional. Set `archive_path` to a local cache directory. To recover files after eviction, also set `codex_history_path` to the local Codex data directory. The fallback looks for a matching SHA-256 in that chat’s local record. The record needs to still contain the embedded image. If the cache would exceed 1 GiB, it removes its oldest originals toward a 512 MiB target.
