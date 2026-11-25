@@ -34,6 +34,7 @@
 // so a Codex session run by another app arrives under that app's name and is
 // left alone until you add it here yourself.
 const DEFAULT_AGENTS = ["codex"]
+const DEFAULT_MODELS = ["codex/*", "gpt-*", "chatgpt-*"]
 
 // onRequest is called with the body the agent sent, before magpie routes it.
 // Return the body to send a changed one, undefined to send it as it came.
@@ -94,9 +95,13 @@ export function onRequest(body, ctx) {
 
 function matches(ctx, o) {
   if (o.agents.length && !o.agents.includes(ctx.agent)) return false
-  return !o.models.length || o.models.some((m) => m.endsWith("/*")
-    ? typeof ctx.model === "string" && ctx.model.startsWith(m.slice(0, -1))
-    : m === ctx.model)
+  if (!o.models.length) return true
+  if (typeof ctx.model !== "string") return false
+  return o.models.some((rule) => {
+    if (!rule.endsWith("*")) return rule === ctx.model
+    const name = rule.includes("/") ? ctx.model : ctx.model.slice(ctx.model.lastIndexOf("/") + 1)
+    return name.startsWith(rule.slice(0, -1))
+  })
 }
 
 function dshImageRoute(ctx) {
@@ -213,7 +218,7 @@ function options(raw) {
     keep_audio: o.keep_audio === true,
     // An explicit [] means every agent; leaving the option out means Codex.
     agents: "agents" in o ? list(o.agents) : DEFAULT_AGENTS,
-    models: "models" in o ? list(o.models) : ["codex/*"],
+    models: "models" in o ? list(o.models) : DEFAULT_MODELS,
     tools: list(o.tools),
     attachments: o.attachments !== false,
     placeholder: typeof o.placeholder === "string" ? o.placeholder : "",

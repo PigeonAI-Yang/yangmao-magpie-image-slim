@@ -17,7 +17,7 @@ magpie plugin add github:PigeonAI-Yang/yangmao-magpie-image-slim
 
 You can also look for **Yangmao · Image Slim** in Magpie’s **Plugins → Discover → Unofficial**. If you use the standalone Windows executable, you can run the same subcommands with its full path.
 
-Open the plugin's options and save `"gatewayTimeoutMs": 15000` in the JSON to give large batches time to process. The initial model scope is Magpie's `codex/*` routes.
+Open the plugin's options and save `"gatewayTimeoutMs": 15000` in the JSON to give large batches time to process. The default scope covers `codex/*` routes and GPT or ChatGPT model names requested by Codex, with or without a provider prefix. If you previously saved `"models": ["codex/*"]`, change it to `"models": ["codex/*", "gpt-*", "chatgpt-*"]` to include native names such as `gpt-6.2-sol`.
 
 ## Use
 

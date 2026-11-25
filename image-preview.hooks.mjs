@@ -5,7 +5,7 @@ const { collect, currentImages, dshImageRoute, matches, options, placeholder, re
 const worker = fileURLToPath(new URL("./image-preview.py", import.meta.url))
 const MAX_PREVIEW_BYTES = 128_000
 const FORWARDING_MARGIN = 256_000
-const DISPATCH_HOOK_BUDGET = 30_000_000
+const HOOK_BODY_BUDGET = 30_000_000
 const THREAD_ID = /^[a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12}$/
 const CHECKSUM = /^[a-f0-9]{64}$/
 
@@ -92,10 +92,12 @@ export async function onRequest(body, ctx) {
   const changed = hasLegacyPath || audio.length > 0
   const currentStart = turnStart(found.turns, 1)
   const dispatched = currentStart >= 0 && found.latestDispatch === currentStart
-  if (!imageRoute || !found.images.length || (!dsh && !dispatched && afterAudio < policy.trigger_bytes)) return changed ? body : undefined
+  const nativeCodex = ctx.agent === "codex" && ctx.path === "/backend-api/codex/responses" &&
+    typeof ctx.model === "string" && !ctx.model.includes("/")
   let budget = Math.max(Math.floor(requestBudget * 0.95), requestBudget - FORWARDING_MARGIN)
   // The plugin host reads a complete hook reply as one line, with a 32 MiB limit.
-  if (dispatched || dsh) budget = Math.min(budget, DISPATCH_HOOK_BUDGET)
+  if (dispatched || dsh || nativeCodex) budget = Math.min(budget, HOOK_BODY_BUDGET)
+  if (!imageRoute || !found.images.length || (!dsh && !dispatched && afterAudio < Math.min(policy.trigger_bytes, budget))) return changed ? body : undefined
   const previousTurns = Number.isSafeInteger(ctx.options.preview_turns) ? Math.max(0, ctx.options.preview_turns) : 5
   const historyStart = turnStart(found.turns, 1 + previousTurns)
   if (currentStart < 0) return changed ? body : undefined
