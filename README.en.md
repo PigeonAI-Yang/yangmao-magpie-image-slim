@@ -36,3 +36,10 @@ Turn the plugin off with `magpie plugin off yangmao-magpie-image-slim`.
 ## Credits
 
 This project builds on Euan Guo’s [magpie-middleware-image-slim](https://github.com/euanguo/magpie-middleware-image-slim). The original copyright and [MIT license](LICENSE) are included. Yangmao maintains this edition.
+
+## Yangmao open source
+
+[Project directory and source links](https://github.com/PigeonAI-Yang/yangmao-skill/blob/main/OPEN-SOURCE.md) · [Yangmao website](https://ymtuan.live/)
+
+- Creator tools and skills: [Free AI allowances](https://github.com/PigeonAI-Yang/yangmao-skill) · [X article writing](https://github.com/PigeonAI-Yang/x-article-creator) · [Video publisher](https://github.com/PigeonAI-Yang/yangmao-publisher)
+- Magpie plugins: **Codex image slimming** · [Devin image cache](https://github.com/PigeonAI-Yang/yangmao-magpie-devin-image-history)
